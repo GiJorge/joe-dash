@@ -1,0 +1,11 @@
+services:
+  joe-dash:
+    build: .
+    container_name: joe-dash
+    image: joe-dash  # Updated image name
+    ports:
+      - "9000:8080"
+    volumes:
+      # Maps your host folder to the internal data folder
+      - /opt/joe-dash/data:/app/backend/data:z
+    restart: always

@@ -1,0 +1,22 @@
+# Databases & Local Data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend dependencies
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+
+# Backend binaries & temp files
+main
+backend/main
+*.exe
+*.out
+
+# Git and OS metadata
+.git
+.gitignore
+.DS_Store
