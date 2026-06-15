@@ -15,8 +15,20 @@ import (
 	//"github.com/shirou/gopsutil/v3/host" // Add this
 	"time"
 	"math"
+	"sync"
+"net"
+	"net/url"
+"fmt"
+
+	"context"
+
+"bufio"
 
 
+
+	
+
+	
 
 	_ "modernc.org/sqlite"
 )
@@ -34,6 +46,8 @@ type AppLink struct {
 }
 
 var db *sql.DB
+var statusMap = make(map[int]string) // Key: App ID, Value: "online"/"offline"
+var statusMutex sync.RWMutex        // Prevents data corruption when reading/writing at the same time
 
 func main() {
 	// 1. Initialize Database
@@ -56,6 +70,10 @@ func main() {
 		icon TEXT
 	);`
 	db.Exec(query)
+
+// START THE BACKGROUND WORKER HERE
+    go startStatusChecker()
+
 
 	// 3. Setup Routes
 	mux := http.NewServeMux()
@@ -91,6 +109,57 @@ mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 
 
 
+func startStatusChecker() {
+	// Print once on startup so you know it's alive
+	log.Println("[STATUS CHECKER] Background worker initialized.")
+	
+	for {
+		rows, err := db.Query("SELECT id, name, url FROM apps")
+		if err != nil {
+			log.Println("[STATUS CHECKER] Database Error:", err)
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
+		type Job struct {
+			ID   int
+			Name string
+			URL  string
+		}
+		var jobs []Job
+		for rows.Next() {
+			var j Job
+			rows.Scan(&j.ID, &j.Name, &j.URL)
+			jobs = append(jobs, j)
+		}
+		rows.Close()
+
+		var wg sync.WaitGroup
+		for _, job := range jobs {
+			wg.Add(1)
+			go func(id int, name string, urlStr string) {
+				defer wg.Done()
+				
+				status, errMsg := checkLiveness(urlStr)
+
+				// SILENT SUCCESS: Only log if a site actually goes OFFLINE
+				if status == "offline" {
+					log.Printf("⚠️ [ALERT] -> %s (%s) is OFFLINE! Reason: %s\n", name, urlStr, errMsg)
+				}
+
+				statusMutex.Lock()
+				statusMap[id] = status
+				statusMutex.Unlock()
+			}(job.ID, job.Name, job.URL)
+		}
+		wg.Wait()
+
+		// Sleep for 30 seconds
+		time.Sleep(30 * time.Second)
+	}
+}
+
+
 // 1. Create a custom handler to serve index.html for unknown paths
 func spaHandler(fs http.FileSystem) http.Handler {
     fileServer := http.FileServer(fs)
@@ -108,37 +177,109 @@ func spaHandler(fs http.FileSystem) http.Handler {
 }
 
 
-// checkLiveness sends a quick HTTP request to verify if the link is reachable
-func checkLiveness(targetURL string) string {
-	// Fallback for local servers provided without http:// or https://
-	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-		targetURL = "http://" + targetURL
-	}
 
-	client := http.Client{
-		Timeout: 3 * time.Second, // Don't let slow servers hang the dashboard
-	}
 
-	// Using HEAD is faster than GET because it doesn't download the body text/HTML
-	resp, err := client.Head(targetURL)
+// parseTermuxHosts manually reads the Termux hosts file to bypass Go's environment lookup bugs
+func parseTermuxHosts(searchHost string) string {
+	// Dynamically acquire Termux's internal storage prefix path ($PREFIX)
+	termuxPrefix := os.Getenv("PREFIX")
+	if termuxPrefix == "" {
+		termuxPrefix = "/data/data/com.termux/files/usr" // Standard fallback path
+	}
+	hostsPath := termuxPrefix + "/etc/hosts"
+
+	file, err := os.Open(hostsPath)
 	if err != nil {
-		// Fallback to GET just in case the server blocks HEAD requests
-		resp, err = client.Get(targetURL)
-		if err != nil {
-			return "offline"
+		return ""
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines or commented configurations
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Split fields by whitespace chunks
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			ip := fields[0]
+			// Check all mapped domains on this line entry
+			for _, domain := range fields[1:] {
+				if strings.ToLower(domain) == strings.ToLower(searchHost) {
+					return ip
+				}
+			}
 		}
 	}
-	defer resp.Body.Close()
-
-	// Consider any 2xx or 3xx status code as online
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		return "online"
-	}
-	return "offline"
+	return ""
 }
 
 
 
+
+
+
+func checkLiveness(targetURL string) (string, string) {
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		targetURL = "http://" + targetURL
+	}
+
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return "offline", fmt.Sprintf("URL Parse Error: %v", err)
+	}
+
+	hostOnly := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		if parsedURL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	baseDialer := &net.Dialer{Timeout: 2 * time.Second}
+	var targetAddress string
+
+	// 1. Manually check Termux local hosts file first
+	localIP := parseTermuxHosts(hostOnly)
+	if localIP != "" {
+		targetAddress = net.JoinHostPort(localIP, port)
+	} else {
+		// 2. Fallback to Cloudflare Public DNS for external sites (e.g., joeserv.com.et)
+		resolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return baseDialer.DialContext(ctx, "udp", "1.1.1.1:53")
+			},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2 * time.Second)
+		publicIps, err := resolver.LookupIPAddr(ctx, hostOnly)
+		cancel()
+
+		if err != nil || len(publicIps) == 0 {
+			return "offline", fmt.Sprintf("DNS Lookup failed globally and locally: %v", err)
+		}
+		targetAddress = net.JoinHostPort(publicIps[0].IP.String(), port)
+	}
+
+	// 3. Perform the network socket connection check
+	ctx, cancel := context.WithTimeout(context.Background(), 2 * time.Second)
+	defer cancel()
+
+	conn, err := baseDialer.DialContext(ctx, "tcp", targetAddress)
+	if err != nil {
+		return "offline", fmt.Sprintf("TCP Dial Failed to %s: %v", targetAddress, err)
+	}
+	conn.Close()
+
+	return "online", "success"
+}
 
 
 
@@ -250,6 +391,7 @@ func enableCORS(next http.Handler) http.Handler {
 
 // appsHandler handles list and create
 func appsHandler(w http.ResponseWriter, r *http.Request) {
+
 	if r.Method == "GET" {
 		rows, err := db.Query("SELECT id, name, url, icon FROM apps ORDER BY id ASC")
 		if err != nil {
@@ -259,14 +401,23 @@ func appsHandler(w http.ResponseWriter, r *http.Request) {
 		defer rows.Close()
 
 		apps := []AppLink{}
+		statusMutex.RLock() // Lock for reading safely
 		for rows.Next() {
 			var a AppLink
 			rows.Scan(&a.ID, &a.Name, &a.URL, &a.Icon)
-// Check status dynamically before returning to frontend
-            a.Status = checkLiveness(a.URL)
+				
+
+				// Instantly pull the status from memory. 
+            // If the background loop hasn't run yet, default to "online"
+            if status, exists := statusMap[a.ID]; exists {
+                a.Status = status
+            } else {
+                a.Status = "online" 
+            }
 
 			apps = append(apps, a)
 		}
+		statusMutex.RUnlock() // Unlock reading
 		json.NewEncoder(w).Encode(apps)
 
 	} else if r.Method == "POST" {
@@ -278,6 +429,9 @@ func appsHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(a)
 	}
 }
+
+
+
 
 // resourceHandler handles update and delete based on ID
 func resourceHandler(w http.ResponseWriter, r *http.Request) {
