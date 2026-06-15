@@ -26,7 +26,7 @@ import (
 
 
 
-	
+	"github.com/gorilla/websocket"
 
 	
 
@@ -36,6 +36,18 @@ import (
 //go:embed frontend/dist/*
 var frontendAssets embed.FS
 
+
+var upgrader = websocket.Upgrader{
+    ReadBufferSize:  1024,
+    WriteBufferSize: 1024,
+    CheckOrigin: func(r *http.Request) bool {
+        return true // Allow Vue dev server or any client to connect
+    },
+}
+
+// Keep track of active dashboard connections
+var wsClients = make(map[*websocket.Conn]bool)
+var wsMutex sync.Mutex
 
 type AppLink struct {
 	ID   int    `json:"id"`
@@ -79,7 +91,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/apps", appsHandler)       // Handles GET (all) and POST (add)
 	mux.HandleFunc("/api/apps/", resourceHandler) // Handles PUT (edit) and DELETE (remove)
-
+mux.HandleFunc("/ws", handleWebSockets)
 	mux.HandleFunc("/api/stats", getStats)
 // The folder is now at frontend/dist relative to main.go
 distFS, err := fs.Sub(frontendAssets, "frontend/dist")
@@ -107,6 +119,35 @@ mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
     log.Fatal(http.ListenAndServe(":10000", enableCORS(mux)))
 }
 
+
+
+func handleWebSockets(w http.ResponseWriter, r *http.Request) {
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        log.Println("WebSocket Upgrade Error:", err)
+        return
+    }
+    
+    wsMutex.Lock()
+    wsClients[conn] = true
+    wsMutex.Unlock()
+
+    log.Println("🔌 New dashboard tab connected via WebSocket")
+
+    // Keep connection alive, listen for client disconnects
+    go func() {
+        for {
+            if _, _, err := conn.ReadMessage(); err != nil {
+                wsMutex.Lock()
+                delete(wsClients, conn)
+                wsMutex.Unlock()
+                conn.Close()
+                log.Println("❌ Dashboard tab closed WebSocket connection")
+                break
+            }
+        }
+    }()
+}
 
 
 func startStatusChecker() {
@@ -154,10 +195,40 @@ func startStatusChecker() {
 		}
 		wg.Wait()
 
+		// Build a quick snapshot payload to send to Vue
+		type StatusUpdate struct {
+			ID     int    `json:"id"`
+			Status string `json:"status"`
+		}
+		var payload []StatusUpdate
+		
+		statusMutex.RLock()
+		for id, status := range statusMap {
+			payload = append(payload, StatusUpdate{ID: id, Status: status})
+		}
+		statusMutex.RUnlock()
+
+		// Broadcast this payload to all open Vue connections instantly
+		wsMutex.Lock()
+		for client := range wsClients {
+			err := client.WriteJSON(payload)
+			if err != nil {
+				log.Println("WebSocket broadcast failed, closing client:", err)
+				client.Close()
+				delete(wsClients, client)
+			}
+		}
+		wsMutex.Unlock()
+
+	
 		// Sleep for 30 seconds
 		time.Sleep(30 * time.Second)
 	}
 }
+
+
+
+
 
 
 // 1. Create a custom handler to serve index.html for unknown paths
