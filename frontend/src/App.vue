@@ -67,7 +67,9 @@ onMounted(fetchApps);
 
 <template>
 <div class="min-h-screen bg-slate-260 text-slate-900 dark:bg-[#0f172a] dark:text-slate-200 transition-colors duration-300">
-    <NavBar :isSettings="showSettings" @toggle-settings="showSettings = !showSettings" >
+    <NavBar :isSettings="showSettings" @toggle-settings="showSettings = !showSettings"
+    
+    @go-home="showSettings = false">
       <ThemeToggle />
       </NavBar>
    

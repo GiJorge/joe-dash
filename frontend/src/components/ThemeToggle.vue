@@ -27,6 +27,6 @@ onMounted(() => {
 
 <template>
   <button @click="toggleTheme" class="p-2 rounded-lg bg-slate-100 dark:bg-slate-800 transition-colors">
-    {{ isDark ? '🌞' : '🌙' }}
+    {{ isDark ? '☀️' : '🌗' }}
   </button>
 </template>

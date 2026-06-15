@@ -13,7 +13,7 @@ frontend/node_modules/
 frontend/dist/
 dist/
 frontend/dist/
-
+termux-dash
 
 # Env
 .env

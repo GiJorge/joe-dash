@@ -6,6 +6,8 @@ services:
     ports:
       - "9000:8080"
     volumes:
+      - /etc/os-release:/host/etc/os-release:ro
       # Maps your host folder to the internal data folder
       - /opt/joe-dash/data:/app/backend/data:z
+      - /mnt/host_thermal:/mnt/host_thermal:ro   # Keep your temp mount too
     restart: always
